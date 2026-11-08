@@ -1,7 +1,7 @@
 package com.skloda.agentscope.runtime;
 
-import com.skloda.agentscope.middleware.ApprovalMiddleware;
 import com.skloda.agentscope.hook.ObservabilityHook;
+import com.skloda.agentscope.middleware.ApprovalMiddleware;
 import com.skloda.agentscope.service.ApprovalService;
 import io.agentscope.core.ReActAgent;
 import io.agentscope.core.event.AgentEvent;
@@ -70,39 +70,89 @@ public class AgentRuntime implements StreamingAgentRuntime {
     }
 
     /**
-     * Stream agent response as Flux.
-     * Merges manual multi-agent events (from EventSink) with automatic agent lifecycle events.
+     * 把一次 Agent 执行转换成前端可消费的 SSE 事件流。
      *
-     * @param userMsg          the user message
-     * @param isApprovalResume true if this is a resume after HITL approval
+     * <p>返回的每个 Map 都是一个 SSE 数据对象，通常至少包含 {@code type} 字段。
+     * 这个方法合并了两类事件：
+     * <ol>
+     *   <li>Agent 自动产生的事件：模型调用、思考、文本增量、工具调用、最终结果等；
+     *   <li>多 Agent 编排代码手动产生的事件：pipeline、routing、handoff 等。</li>
+     * </ol>
+     *
+     * <p>{@code AgentEvent} 并不是在这里“生成类型”的。{@code agent.streamEvents(userMsg)}
+     * 会启动 AgentScope 的 ReActAgent 执行流程；当执行到某个阶段时，框架创建对应的
+     * {@link AgentEvent} 子类实例并写入其内部 FluxSink。例如：
+     *
+     * <pre>{@code
+     * AgentStartEvent           -> AgentEventType.AGENT_START
+     * ModelCallStartEvent       -> AgentEventType.MODEL_CALL_START
+     * TextBlockDeltaEvent       -> AgentEventType.TEXT_BLOCK_DELTA
+     * ToolCallStartEvent        -> AgentEventType.TOOL_CALL_START
+     * AgentResultEvent          -> AgentEventType.AGENT_RESULT
+     * AgentEndEvent             -> AgentEventType.AGENT_END
+     * }</pre>
+     *
+     * <p>这些子类分别重写 {@link AgentEvent#getType()}，所以 {@code event.getType()} 返回的是
+     * 该事件对应的 {@code AgentEventType} 枚举。{@link AgentEventMapper} 再按这个枚举生成前端
+     * 使用的 Map（例如 {@code TEXT_BLOCK_DELTA} 会变成 {@code {"type":"text", ...}}）。
+     *
+     * @param userMsg          用户消息；审批通过后恢复执行时可以为 {@code null}
+     * @param isApprovalResume {@code false} 表示普通请求，{@code true} 表示 HITL 审批后的续跑
+     * @return 合并后的前端事件流；只有被订阅后，Reactor 才会实际拉取 Agent 事件
      */
     public Flux<Map<String, Object>> stream(Msg userMsg, boolean isApprovalResume) {
         log.debug("Starting stream for agent: {} (resume={})", agent.getName(), isApprovalResume);
 
-        // Clean up stale pending tool calls from a previous (interrupted/timed-out) request
-        // before starting a new one. When sessions are used, the AgentStateStore persists
-        // conversation context across requests; if the previous call was interrupted after
-        // the LLM emitted a ToolUseBlock but before the acting phase completed, that block
-        // remains in context without a matching ToolResultBlock. On the next request,
-        // AgentScope's enablePendingToolRecovery would auto-generate an error result
-        // ("Auto-generated error result for pending tool call"), polluting the conversation.
-        // We proactively remove such orphaned assistant messages to keep the context clean.
+        // 关键步骤 1：普通新请求开始时，先清理上一次请求中断后遗留的“孤立工具调用”。
+        //
+        // 会话模式下，AgentStateStore 会跨请求保存上下文。如果上次请求在模型已经
+        // 生成 ToolUseBlock、但工具还没有执行完时被取消或超时，上下文中就会留下
+        // 一个没有对应 ToolResultBlock 的工具调用。下一次请求时，AgentScope 的
+        // pending-tool-recovery 会自动补一个错误结果，污染后续对话，因此这里主动
+        // 删除这类残留的 assistant 消息。
+        //
+        // 审批续跑不能清理，因为待执行的工具调用正是恢复流程要继续处理的内容。
         if (!isApprovalResume) {
             clearStalePendingToolCalls();
         }
 
-        // Manual multi-agent events from EventSink (pipeline, routing, handoff, etc.)
+        // 关键步骤 2：取得“手动多 Agent 事件”流。
+        //
+        // 这条流来自 Sinks.Many<Map<String,Object>>，事件由编排代码通过
+        // ObservabilityHook/EventSink 主动 emit，例如 pipeline_start、routing_decision、
+        // handoff_start。它与下面 AgentScope 自动产生的 AgentEvent 是完全不同的来源。
         Flux<Map<String, Object>> sinkEvents = hook.getEventSink().asFlux();
 
         Flux<Map<String, Object>> agentEvents;
         if (isApprovalResume) {
+            // 审批后的续跑：重新调用 Agent，以取得审批后执行阶段产生的完整事件流。
             agentEvents = createApprovalResumeStream(userMsg);
         } else {
-            // Use handle() instead of map()+filter(): map() throws on null return,
-            // but AgentEventMapper.apply() intentionally returns null for drop events.
+            // 普通请求：AgentScope 自动产生事件。
+            //
+            // streamEvents 返回 Flux<AgentEvent>。上游每一个元素都是框架创建的某个具体
+            // AgentEvent 子类实例，例如 AgentStartEvent、ModelCallStartEvent、
+            // TextBlockDeltaEvent、ToolCallStartEvent、ToolResultEndEvent 等。事件类型
+            // 不是这里手工判断出来的：框架在 ReAct 循环执行到相应阶段时创建对应子类，
+            // 子类的 getType() 再返回对应 AgentEventType。
+            //
+            // handle 是“一对零或一”的转换：
+            //   1. event 是上游 Flux 中的一条 AgentEvent；
+            //   2. mapAgentEvent(event) 把它转换成前端需要的 Map；
+            //   3. 只有转换结果非空时才调用 sink.next(map)，否则直接跳过。
+            //
+            // 这里不用 map，是因为 AgentEventMapper.apply() 会对块边界等无需展示的事件
+            // 返回 null；Reactor 的 map 不允许返回 null，而 handle 可以直接不向下游发元素。
             agentEvents = agent.streamEvents(userMsg)
                     .handle((event, sink) -> {
+                        // mapAgentEvent 内部先调用 AgentEventMapper.apply(event)。
+                        // Mapper 用 switch(event.getType()) 生成 type 字段，并对 tool_start
+                        // 额外补充 MCP 来源信息。
                         Map<String, Object> map = mapAgentEvent(event);
+
+                        // null/空 Map 表示该事件仅供框架内部协调，前端不需要展示。
+                        // 注意：这个 sink 是 handle 提供的下游 SynchronousSink，
+                        // 不是上面手动多 Agent 事件使用的 EventSink。
                         if (map != null && !map.isEmpty()) {
                             sink.next(map);
                         }
@@ -122,17 +172,31 @@ public class AgentRuntime implements StreamingAgentRuntime {
         // permanently disabled ("只能聊一次"). Moving the sink completion to
         // agentEvents.doFinally breaks the cycle: agent done -> sink done ->
         // merge done -> 'done' emitted.
+        //
+        // 关键步骤 3：Agent 事件结束时，同时结束手动事件流。
+        //
+        // Flux.merge() 必须等待两条上游流都完成，自身才会完成。Agent 事件流会自然
+        // complete/error，但 Sinks.Many 不会自动结束，所以这里用 doFinally 结束
+        // EventSink。否则 merge 永远不完成，后面的 done/pending_approval 也发不出去。
+        //
+        // 流程是：agentEvents 结束 -> EventSink 结束 -> merge 完成
+        //       -> concatWith 的收尾事件被发送。
         Flux<Map<String, Object>> agentEventsWithSinkCompletion = agentEvents
                 .doFinally(signal -> hook.getEventSink().complete());
 
+        // 关键步骤 4：并行合并两条事件流。Agent 生命周期事件和手动编排事件哪个先发生
+        // 就先向下游发送，不做固定顺序等待。
         return Flux.merge(sinkEvents, agentEventsWithSinkCompletion)
                 .concatWith(Mono.fromCallable(() -> {
-                    // On completion, check if approval was triggered
+                    // 所有 Agent 事件结束后，只追加一个收尾事件：
+                    // - 如果中间件拦截到了待审批工具，返回 pending_approval；
+                    // - 否则返回 done，通知前端本轮流结束。
                     if (approvalMiddleware != null && approvalMiddleware.isApprovalTriggered()) {
                         return handleApprovalCompletion();
                     }
                     return Map.of("type", "done");
                 }))
+                // 无论正常结束、异常还是客户端取消，都释放 Runtime 相关资源。
                 .doOnCancel(this::close)
                 .doOnComplete(this::close)
                 .doOnError(e -> {
